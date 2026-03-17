@@ -1,0 +1,188 @@
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import TwistStamped
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32MultiArray
+
+from gazebo_msgs.srv import SetEntityState
+from gazebo_msgs.msg import EntityState
+
+import time
+import random
+
+from lr_ppo_baseline.observation import ObservationBuilder
+from lr_ppo_baseline.reward import RewardFunction
+from lr_ppo_baseline.termination import TerminationChecker
+
+
+class EnvNode(Node):
+    def __init__(self):
+        super().__init__('env_node')
+
+        # --------------------
+        # Gazebo reset service
+        # --------------------
+        self.reset_client = self.create_client(
+            SetEntityState,
+            '/gazebo/set_entity_state'
+        )
+
+        # Do NOT block forever
+        if not self.reset_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn(
+                "Gazebo reset service not available yet"
+            )
+
+        # --------------------
+        # Publishers
+        # --------------------
+        self.cmd_pub = self.create_publisher(
+            TwistStamped, '/cmd_vel', 10
+        )
+
+        self.obs_pub = self.create_publisher(
+            Float32MultiArray, '/ppo/observation', 10
+        )
+
+        # --------------------
+        # Subscribers
+        # --------------------
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, 10
+        )
+        self.odom_sub = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, 10
+        )
+
+        # --------------------
+        # Timer
+        # --------------------
+        self.timer = self.create_timer(0.1, self.step)
+
+        # --------------------
+        # RL components
+        # --------------------
+        self.obs_builder = ObservationBuilder()
+        self.reward_fn = RewardFunction()
+        self.termination_checker = TerminationChecker()
+
+        # State
+        self.scan = None
+        self.odom = None
+        self.goal_distance = 5.0
+
+        self.get_logger().info("env_node started: RL ENVIRONMENT MODE")
+
+self.last_reset_time = time.time()
+self.reset_cooldown = 1.0
+self.just_reset = False
+
+    # --------------------
+    # Callbacks
+    # --------------------
+    def scan_callback(self, msg):
+        self.scan = msg
+
+    def odom_callback(self, msg):
+        self.odom = msg
+
+    # --------------------
+    # Main step
+    # --------------------
+    def step(self):
+        if self.scan is None or self.odom is None:
+            return
+
+        # 1. Observation
+        observation = self.obs_builder.build_observation(
+            self.scan, self.odom
+        )
+
+        obs_msg = Float32MultiArray()
+        obs_msg.data = observation.tolist()
+        self.obs_pub.publish(obs_msg)
+
+        # 2. Action (temporary random)
+        cmd = TwistStamped()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.twist.linear.x = 0.2
+        cmd.twist.angular.z = random.uniform(-0.3, 0.3)
+        self.cmd_pub.publish(cmd)
+
+        # 3. Fake goal progress
+        self.goal_distance = max(0.0, self.goal_distance - 0.01)
+
+        # 4. Reward
+        reward = self.reward_fn.compute(
+            scan_msg=self.scan,
+            odom_msg=self.odom,
+            goal_distance=self.goal_distance,
+            goal_reached=False,
+        )
+
+        # 5. Termination
+        done, info = self.termination_checker.check(
+            scan_msg=self.scan,
+            goal_distance=self.goal_distance,
+        )
+
+        self.get_logger().info(
+            f"obs_dim={len(observation)} | reward={reward:.3f} | done={done}"
+        )
+if self.just_reset:
+    self.just_reset = False
+    return
+
+now = time.time()
+if done and (now - self.last_reset_time) > self.reset_cooldown:
+    self.reset_robot()
+    self.reward_fn.reset()
+    self.termination_checker.reset()
+    self.goal_distance = 5.0
+    self.last_reset_time = now
+    self.just_reset = True
+
+        # 6. Reset
+        if done:
+            self.get_logger().info(f"Episode finished: {info}")
+            self.reset_robot()
+            self.reward_fn.reset()
+            self.termination_checker.reset()
+            self.goal_distance = 5.0
+
+    # --------------------
+    # Reset robot
+    # --------------------
+def reset_robot(self):
+    state = EntityState()
+    state.name = 'burger'
+
+    # SAFE SPAWN POSITION (NOT IN WALL)
+    state.pose.position.x = -1.5
+    state.pose.position.y = 0.0
+    state.pose.position.z = 0.01
+    state.pose.orientation.w = 1.0
+
+    # RESET VELOCITIES (CRITICAL)
+    state.twist.linear.x = 0.0
+    state.twist.linear.y = 0.0
+    state.twist.linear.z = 0.0
+    state.twist.angular.x = 0.0
+    state.twist.angular.y = 0.0
+    state.twist.angular.z = 0.0
+
+    req = SetEntityState.Request()
+    req.state = state
+
+    self.reset_client.call_async(req)
+
+    time.sleep(0.3)  # let physics settle
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = EnvNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
